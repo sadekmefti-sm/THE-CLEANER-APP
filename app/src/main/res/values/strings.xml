@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">CleanVault</string>
+    <string name="notification_channel_name">Gallery Intelligence Scanner</string>
+    <string name="notification_channel_desc">Foreground progress for 100% offline gallery clustering, OCR guardrail, and media compression</string>
+    <string name="scan_notification_title">Scanning Gallery Library</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="onboarding_title">Reclaim Gigabytes, Zero Cloud Uploads</string>
+    <string name="onboarding_subtitle">100% offline dHash burst clustering, Laplacian sharpness + ML face scoring, OCR document protection, and Media3 hardware compression.</string>
+    <string name="quick_batch_title">Quick Batch (Instant Start)</string>
+    <string name="quick_batch_desc">Scan the latest 500 items immediately to start swiping in under 2 seconds while queuing the rest.</string>
+    <string name="full_scan_title">Full Deep Scan Now</string>
+    <string name="full_scan_desc">Index your entire gallery immediately with a live dashboard and persistent foreground service protection.</string>
+    <string name="seed_sample_media">Seed Sample Gallery (Burst + Receipt + Video)</string>
+</resources>

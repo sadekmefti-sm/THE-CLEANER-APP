@@ -1,0 +1,6 @@
+{
+  "name": "CleanVault",
+  "description": "Privacy-first on-device Android gallery cleanup, burst best-shot clustering, OCR document guardrail, and Media3 hardware video/photo compressor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
