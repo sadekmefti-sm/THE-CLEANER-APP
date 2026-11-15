@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
@@ -34,12 +35,14 @@ import com.example.domain.scanner.RawMediaStoreRow
 import com.example.domain.scanner.SafeBitmapDecoder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -91,11 +94,10 @@ class ScanNotificationActionReceiver : BroadcastReceiver() {
 }
 
 /**
- * Android 14/15+ Compliant Foreground Media Processing Scanner Worker:
- * - Promoted via setForeground() with ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
- * - Bounded coroutine dispatcher: Dispatchers.Default.limitedParallelism(2)
- * - Chunked Room @Transaction upserts in batches of 100 items
- * - Live NotificationCompat progress with Pause/Resume and Cancel PendingIntents
+ * Foreground Media Processing Scanner Worker:
+ * - Uses ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING on API 35+ and
+ *   ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC on API 30-34.
+ * - Resets scan_telemetry.isScanning in a finally block so mid-scan termination never leaves stale state.
  */
 class GalleryScanWorker(
     private val appContext: Context,
@@ -103,6 +105,7 @@ class GalleryScanWorker(
 ) : CoroutineWorker(appContext, params) {
 
     companion object {
+        private const val TAG = "GalleryScanWorker"
         const val UNIQUE_WORK_NAME = "CleanVaultGalleryScanWork"
         const val KEY_SCAN_MODE = "scan_mode"
         const val KEY_HAMMING_BITS = "hamming_bits"
@@ -160,136 +163,154 @@ class GalleryScanWorker(
         ensureNotificationChannel()
         promoteToForegroundSafely(0, 100, 0L, isPaused = false)
 
-        val existingTelemetry = dao.getScanTelemetry() ?: ScanTelemetryEntity()
-        dao.upsertScanTelemetry(
-            existingTelemetry.copy(
-                isScanning = true,
-                isPaused = false,
-                scanMode = scanMode,
-                statusMessage = "Checking MediaStore generation delta..."
-            )
-        )
+        var willChainFollowUpScan = false
 
-        // 1. Incremental Delta Query (<50ms on subsequent launches)
-        val generationList = dao.getAllGenerationRecords()
-        val generationMap = generationList.associateBy { it.mediaStoreId }
-
-        val (deltaRows, deletedIds) = MediaStoreIncrementalScanner.queryMediaStoreDelta(
-            contentResolver = contentResolver,
-            existingRecords = generationMap,
-            maxItems = scanMode.maxInitialItems
-        )
-
-        if (deletedIds.isNotEmpty()) {
-            dao.deleteMediaByIds(deletedIds.toList())
-        }
-
-        val totalToProcess = deltaRows.size
-        var processedCount = 0
-        var clutterBytesFound = 0L
-
-        // 2. Process in chunked batches of 100 items using bounded parallelism (2 threads max)
-        val chunks = deltaRows.chunked(100)
-        for (chunk in chunks) {
-            if (isStopped || ScanControlBus.isCancelled.get()) {
-                dao.upsertScanTelemetry(
-                    (dao.getScanTelemetry() ?: ScanTelemetryEntity()).copy(
-                        isScanning = false,
-                        isPaused = false,
-                        statusMessage = "Scan stopped"
-                    )
-                )
-                return Result.failure()
-            }
-
-            // Respect Pause action from notification or UI
-            while (ScanControlBus.isPaused.get() && !isStopped && !ScanControlBus.isCancelled.get()) {
-                promoteToForegroundSafely(processedCount, totalToProcess, clutterBytesFound, isPaused = true)
-                delay(400L)
-            }
-
-            val analyzedBatch = coroutineScope {
-                chunk.map { rawRow ->
-                    async(boundedAnalysisDispatcher) {
-                        val existingTriage = generationMap[rawRow.mediaStoreId]?.triageStatus
-                            ?: TriageStatus.UNREVIEWED
-                        analyzeSingleMediaRow(rawRow, existingTriage)
-                    }
-                }.awaitAll()
-            }
-
-            // Chunked @Transaction insert (100 items max per transaction)
-            dao.upsertMediaChunked(analyzedBatch, 100)
-
-            processedCount += analyzedBatch.size
-            clutterBytesFound += analyzedBatch.filter {
-                it.isBlurryOrBad || it.isScreenshot || it.isSocialMediaClutter ||
-                    (it.mediaType == MediaType.VIDEO && it.sizeBytes > 15 * 1024 * 1024L)
-            }.sumOf { it.sizeBytes }
-
-            val percent = if (totalToProcess > 0) (processedCount * 100) / totalToProcess else 100
-            val statusText = "Scanning Gallery: $processedCount / $totalToProcess ($percent%) • ${formatBytes(clutterBytesFound)} clutter"
-
+        try {
+            val existingTelemetry = dao.getScanTelemetry() ?: ScanTelemetryEntity()
             dao.upsertScanTelemetry(
-                (dao.getScanTelemetry() ?: ScanTelemetryEntity()).copy(
+                existingTelemetry.copy(
                     isScanning = true,
                     isPaused = false,
                     scanMode = scanMode,
-                    scannedCount = processedCount,
-                    totalLibraryCount = maxOf(totalToProcess, dao.getTotalCount()),
-                    clutterBytesFound = clutterBytesFound,
-                    statusMessage = statusText
+                    statusMessage = "Checking MediaStore generation delta..."
                 )
             )
-            promoteToForegroundSafely(processedCount, totalToProcess, clutterBytesFound, isPaused = false)
+
+            // 1. Incremental Delta Query (<50ms on subsequent launches)
+            val generationList = dao.getAllGenerationRecords()
+            val generationMap = generationList.associateBy { it.mediaStoreId }
+
+            val (deltaRows, deletedIds) = MediaStoreIncrementalScanner.queryMediaStoreDelta(
+                contentResolver = contentResolver,
+                existingRecords = generationMap,
+                maxItems = scanMode.maxInitialItems
+            )
+
+            if (deletedIds.isNotEmpty()) {
+                dao.deleteMediaByIds(deletedIds.toList())
+            }
+
+            val totalToProcess = deltaRows.size
+            var processedCount = 0
+            var clutterBytesFound = 0L
+
+            // 2. Process in chunked batches of 100 items using bounded parallelism (2 threads max)
+            val chunks = deltaRows.chunked(100)
+            for (chunk in chunks) {
+                if (isStopped || ScanControlBus.isCancelled.get()) {
+                    return Result.failure()
+                }
+
+                // Respect Pause action from notification or UI
+                while (ScanControlBus.isPaused.get() && !isStopped && !ScanControlBus.isCancelled.get()) {
+                    promoteToForegroundSafely(processedCount, totalToProcess, clutterBytesFound, isPaused = true)
+                    delay(400L)
+                }
+
+                val analyzedBatch = coroutineScope {
+                    chunk.map { rawRow ->
+                        async(boundedAnalysisDispatcher) {
+                            val existingTriage = generationMap[rawRow.mediaStoreId]?.triageStatus
+                                ?: TriageStatus.UNREVIEWED
+                            analyzeSingleMediaRow(rawRow, existingTriage)
+                        }
+                    }.awaitAll()
+                }
+
+                // Chunked @Transaction insert (100 items max per transaction)
+                dao.upsertMediaChunked(analyzedBatch, 100)
+
+                processedCount += analyzedBatch.size
+                clutterBytesFound += analyzedBatch.filter {
+                    it.isBlurryOrBad || it.isScreenshot || it.isSocialMediaClutter ||
+                        (it.mediaType == MediaType.VIDEO && it.sizeBytes > 15 * 1024 * 1024L)
+                }.sumOf { it.sizeBytes }
+
+                val percent = if (totalToProcess > 0) (processedCount * 100) / totalToProcess else 100
+                val statusText = "Scanning Gallery: $processedCount / $totalToProcess ($percent%) • ${formatBytes(clutterBytesFound)} clutter"
+
+                dao.upsertScanTelemetry(
+                    (dao.getScanTelemetry() ?: ScanTelemetryEntity()).copy(
+                        isScanning = true,
+                        isPaused = false,
+                        scanMode = scanMode,
+                        scannedCount = processedCount,
+                        totalLibraryCount = maxOf(totalToProcess, dao.getTotalCount()),
+                        clutterBytesFound = clutterBytesFound,
+                        statusMessage = statusText
+                    )
+                )
+                promoteToForegroundSafely(processedCount, totalToProcess, clutterBytesFound, isPaused = false)
+            }
+
+            // 3. Run Sub-Quadratic O(N log N) Similarity & Burst Clustering
+            dao.upsertScanTelemetry(
+                (dao.getScanTelemetry() ?: ScanTelemetryEntity()).copy(
+                    isScanning = true,
+                    statusMessage = "Clustering burst shots & crowning Best Shots..."
+                )
+            )
+
+            val allAnalyzedPhotos = dao.getAnalyzedPhotosForClustering()
+            val clusteringOutput = SimilarityClusterEngine.buildClusters(
+                contentResolver = contentResolver,
+                analyzedPhotos = allAnalyzedPhotos,
+                sensitivity = sensitivity
+            )
+            dao.replaceAllClusters(
+                clusters = clusteringOutput.clusters,
+                updatedItems = clusteringOutput.updatedMediaItems
+            )
+
+            val clusterReclaimable = clusteringOutput.clusters.sumOf { it.reclaimableBytes }
+            val finalClutterBytes = maxOf(clutterBytesFound, clusterReclaimable)
+            val totalIndexed = dao.getTotalCount()
+
+            dao.upsertScanTelemetry(
+                (dao.getScanTelemetry() ?: ScanTelemetryEntity()).copy(
+                    isScanning = false,
+                    isPaused = false,
+                    scannedCount = totalIndexed,
+                    totalLibraryCount = totalIndexed,
+                    clutterBytesFound = finalClutterBytes,
+                    lastScanTimestampMillis = System.currentTimeMillis(),
+                    statusMessage = "Scan complete • ${clusteringOutput.clusters.size} clusters crowned"
+                )
+            )
+
+            // If Quick Batch (500 items) was chosen and library has more unindexed items, queue remainder
+            if (autoQueueRemainder && deltaRows.size >= ScanMode.QUICK_BATCH.maxInitialItems) {
+                willChainFollowUpScan = true
+                enqueueScan(
+                    context = appContext,
+                    scanMode = ScanMode.FULL_DEEP_SCAN,
+                    sensitivityLevel = sensitivity,
+                    autoQueueRemainder = false
+                )
+            }
+
+            return Result.success()
+        } finally {
+            withContext(NonCancellable) {
+                if (!willChainFollowUpScan) {
+                    val current = dao.getScanTelemetry()
+                    if (current != null && current.isScanning) {
+                        val fallbackMsg = if (isStopped || ScanControlBus.isCancelled.get()) {
+                            "Scan stopped"
+                        } else {
+                            current.statusMessage
+                        }
+                        dao.upsertScanTelemetry(
+                            current.copy(
+                                isScanning = false,
+                                isPaused = false,
+                                statusMessage = fallbackMsg
+                            )
+                        )
+                    }
+                }
+            }
         }
-
-        // 3. Run Sub-Quadratic O(N log N) Similarity & Burst Clustering
-        dao.upsertScanTelemetry(
-            (dao.getScanTelemetry() ?: ScanTelemetryEntity()).copy(
-                isScanning = true,
-                statusMessage = "Clustering burst shots & crowning Best Shots..."
-            )
-        )
-
-        val allAnalyzedPhotos = dao.getAnalyzedPhotosForClustering()
-        val clusteringOutput = SimilarityClusterEngine.buildClusters(
-            contentResolver = contentResolver,
-            analyzedPhotos = allAnalyzedPhotos,
-            sensitivity = sensitivity
-        )
-        dao.replaceAllClusters(
-            clusters = clusteringOutput.clusters,
-            updatedItems = clusteringOutput.updatedMediaItems
-        )
-
-        val clusterReclaimable = clusteringOutput.clusters.sumOf { it.reclaimableBytes }
-        val finalClutterBytes = maxOf(clutterBytesFound, clusterReclaimable)
-        val totalIndexed = dao.getTotalCount()
-
-        dao.upsertScanTelemetry(
-            (dao.getScanTelemetry() ?: ScanTelemetryEntity()).copy(
-                isScanning = false,
-                isPaused = false,
-                scannedCount = totalIndexed,
-                totalLibraryCount = totalIndexed,
-                clutterBytesFound = finalClutterBytes,
-                lastScanTimestampMillis = System.currentTimeMillis(),
-                statusMessage = "Scan complete • ${clusteringOutput.clusters.size} clusters crowned"
-            )
-        )
-
-        // If Quick Batch (500 items) was chosen and library has more unindexed items, queue remainder
-        if (autoQueueRemainder && deltaRows.size >= ScanMode.QUICK_BATCH.maxInitialItems) {
-            enqueueScan(
-                context = appContext,
-                scanMode = ScanMode.FULL_DEEP_SCAN,
-                sensitivityLevel = sensitivity,
-                autoQueueRemainder = false
-            )
-        }
-
-        return Result.success()
     }
 
     private suspend fun analyzeSingleMediaRow(
@@ -350,8 +371,6 @@ class GalleryScanWorker(
             )
         }
 
-        // Photo Pipeline:
-        // 1. Decode 256x256 bitmap for pure-Kotlin dHash, 3x3 Laplacian variance, and luminance histogram
         val bitmap256 = SafeBitmapDecoder.decodeSubsampledBitmap(resolver, uri, 256)
         val visionMetrics = if (bitmap256 != null) {
             val metrics = PureKotlinVisionEngine.analyzeBitmap(bitmap256)
@@ -361,7 +380,6 @@ class GalleryScanWorker(
             null
         }
 
-        // 2. Decode 512x512 bitmap for ML Kit Face Detection & ML Kit Text Recognition (OCR Guardrail)
         val bitmap512 = SafeBitmapDecoder.decodeSubsampledBitmap(resolver, uri, 512)
         val faceResult = if (bitmap512 != null) {
             mlAnalyzer.analyzeFaces(bitmap512)
@@ -387,7 +405,6 @@ class GalleryScanWorker(
         )
 
         val isProtectedDoc = ocrResult?.isDocumentOrReceipt == true
-        // CRITICAL OCR GUARDRAIL: Never mark an item as Blurry/Bad if isDocumentOrReceipt == true
         val isBlurryOrBad = !isProtectedDoc && !isScreenshot && (
             sharpness < 26f ||
                 visionMetrics?.isUnderExposed == true ||
@@ -445,6 +462,8 @@ class GalleryScanWorker(
         runCatching {
             val foregroundInfo = createForegroundInfo(scanned, total, clutterBytes, isPaused)
             setForeground(foregroundInfo)
+        }.onFailure { e ->
+            Log.e(TAG, "Failed to promote GalleryScanWorker to foreground service", e)
         }
     }
 
@@ -530,29 +549,24 @@ class GalleryScanWorker(
             .addAction(cancelAction)
             .build()
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ForegroundInfo(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
-            )
+        val serviceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
         } else {
-            ForegroundInfo(NOTIFICATION_ID, notification)
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         }
+        return ForegroundInfo(NOTIFICATION_ID, notification, serviceType)
     }
 
     private fun ensureNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                appContext.getString(R.string.notification_channel_name),
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = appContext.getString(R.string.notification_channel_desc)
-            }
-            manager?.createNotificationChannel(channel)
+        val manager = appContext.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            appContext.getString(R.string.notification_channel_name),
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = appContext.getString(R.string.notification_channel_desc)
         }
+        manager?.createNotificationChannel(channel)
     }
 
     private fun formatBytes(bytes: Long): String {

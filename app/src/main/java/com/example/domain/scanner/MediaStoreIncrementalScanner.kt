@@ -18,13 +18,11 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
 import android.os.PowerManager
 import android.provider.MediaStore
 import android.provider.Settings
 import com.example.data.local.GenerationRecord
-import com.example.data.local.MediaItemEntity
 import com.example.data.local.MediaType
 import java.io.File
 import java.nio.ByteBuffer
@@ -102,7 +100,7 @@ object MediaStoreIncrementalScanner {
         currentMediaIds: MutableSet<Long>,
         changedOrNewRows: MutableList<RawMediaStoreRow>
     ) {
-        val projection = mutableListOf(
+        val projection = arrayOf(
             MediaStore.MediaColumns._ID,
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.MIME_TYPE,
@@ -111,14 +109,11 @@ object MediaStoreIncrementalScanner {
             MediaStore.MediaColumns.WIDTH,
             MediaStore.MediaColumns.HEIGHT,
             MediaStore.MediaColumns.DATE_ADDED,
-            MediaStore.MediaColumns.DATE_TAKEN
-        ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                add(MediaStore.MediaColumns.RELATIVE_PATH)
-                add(MediaStore.MediaColumns.DURATION)
-                add(MediaStore.MediaColumns.GENERATION_MODIFIED)
-            }
-        }.toTypedArray()
+            MediaStore.MediaColumns.DATE_TAKEN,
+            MediaStore.MediaColumns.RELATIVE_PATH,
+            MediaStore.MediaColumns.DURATION,
+            MediaStore.MediaColumns.GENERATION_MODIFIED
+        )
 
         val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
 
@@ -216,9 +211,6 @@ object BatteryOptimizationHelper {
 
 /**
  * Real MediaStore Sample Seeder for empty emulators or demo testing.
- * Writes real JPEG photos (burst cluster with sharp vs blurry variants, an invoice/receipt with
- * structured OCR text, a dark pocket shot, a screenshot) and a real H.264 MP4 video into MediaStore
- * so all ML Kit, dHash, Laplacian, and Media3 Transformer pipelines operate on real files.
  */
 object SampleMediaSeeder {
 
@@ -227,25 +219,19 @@ object SampleMediaSeeder {
         val baseTime = System.currentTimeMillis()
         var createdCount = 0
 
-        // 1. Burst Cluster A (3 Alpine Sunset shots: 1 ultra-sharp Best Shot + 2 slightly blurred/shifted variants)
         if (insertSyntheticPhoto(resolver, "IMG_BURST_ALPINE_01_SHARP.jpg", "DCIM/Camera", baseTime - 5_000L, 1920, 1440, SeedVariant.BURST_SHARP)) createdCount++
         if (insertSyntheticPhoto(resolver, "IMG_BURST_ALPINE_02_SOFT.jpg", "DCIM/Camera", baseTime - 4_200L, 1920, 1440, SeedVariant.BURST_SOFT)) createdCount++
         if (insertSyntheticPhoto(resolver, "IMG_BURST_ALPINE_03_MOTION.jpg", "DCIM/Camera", baseTime - 3_500L, 1920, 1440, SeedVariant.BURST_SLIGHT_SHIFT)) createdCount++
 
-        // 2. Burst Cluster B (2 Architecture shots: high resolution vs WhatsApp compressed duplicate)
         if (insertSyntheticPhoto(resolver, "IMG_ARCH_ORIGINAL_4K.jpg", "DCIM/Camera", baseTime - 120_000L, 2560, 1920, SeedVariant.ARCH_CRISP)) createdCount++
         if (insertSyntheticPhoto(resolver, "IMG-WA-ARCH-COPY.jpg", "Pictures/WhatsApp", baseTime - 115_000L, 1280, 960, SeedVariant.ARCH_COMPRESSED)) createdCount++
 
-        // 3. OCR Protected Document / Tax Receipt (dense text blocks + financial totals)
         if (insertSyntheticPhoto(resolver, "SCAN_TAX_INVOICE_RECEIPT_2026.jpg", "DCIM/Camera", baseTime - 300_000L, 1600, 2200, SeedVariant.OCR_RECEIPT_DOCUMENT)) createdCount++
 
-        // 4. Screenshot Clutter
         if (insertSyntheticPhoto(resolver, "Screenshot_20261115_SocialFeed.jpg", "Pictures/Screenshots", baseTime - 600_000L, 1080, 2400, SeedVariant.SCREENSHOT)) createdCount++
 
-        // 5. Dark Pocket Shot (Underexposed & blurry)
         if (insertSyntheticPhoto(resolver, "IMG_POCKET_DARK_BLUR.jpg", "DCIM/Camera", baseTime - 900_000L, 1600, 1200, SeedVariant.DARK_POCKET_SHOT)) createdCount++
 
-        // 6. Real Hardware-Encoded MP4 Video for Media3 ExoPlayer & Panda Compressor
         if (insertSyntheticMp4Video(context, "VID_4K_DEMO_CLIP.mp4", baseTime - 60_000L)) createdCount++
 
         return createdCount
@@ -278,7 +264,6 @@ object SampleMediaSeeder {
 
             when (variant) {
                 SeedVariant.BURST_SHARP, SeedVariant.BURST_SOFT, SeedVariant.BURST_SLIGHT_SHIFT -> {
-                    // Rich gradient sky + mountain geometry
                     paint.shader = LinearGradient(
                         0f, 0f, 0f, height.toFloat(),
                         intArrayOf(Color.rgb(18, 35, 82), Color.rgb(214, 96, 58), Color.rgb(248, 190, 85)),
@@ -291,7 +276,6 @@ object SampleMediaSeeder {
                     paint.color = Color.rgb(255, 225, 130)
                     canvas.drawCircle(width * 0.65f + shiftX, height * 0.32f, width * 0.11f, paint)
 
-                    // Crisp high-frequency detail grid on BURST_SHARP so Laplacian variance crowns it Best Shot
                     if (variant == SeedVariant.BURST_SHARP) {
                         paint.color = Color.rgb(25, 32, 48)
                         paint.strokeWidth = 3f
@@ -307,7 +291,6 @@ object SampleMediaSeeder {
                         }
                         paint.style = Paint.Style.FILL
                     } else {
-                        // Softer mountain silhouette with lower high-frequency edge variance
                         paint.color = Color.rgb(34, 42, 60)
                         canvas.drawRect(0f, height * 0.62f, width.toFloat(), height.toFloat(), paint)
                     }
@@ -333,7 +316,6 @@ object SampleMediaSeeder {
                 }
 
                 SeedVariant.OCR_RECEIPT_DOCUMENT -> {
-                    // High-contrast paper receipt with > 12 structured text blocks for ML Kit OCR Guardrail
                     canvas.drawColor(Color.rgb(246, 245, 240))
                     paint.color = Color.rgb(20, 24, 30)
                     paint.typeface = Typeface.MONOSPACE
@@ -372,7 +354,6 @@ object SampleMediaSeeder {
                 }
 
                 SeedVariant.DARK_POCKET_SHOT -> {
-                    // Very low luminance & virtually zero edge sharpness
                     canvas.drawColor(Color.rgb(12, 11, 14))
                     paint.color = Color.rgb(22, 20, 25)
                     canvas.drawCircle(width * 0.4f, height * 0.5f, width * 0.25f, paint)
@@ -386,10 +367,8 @@ object SampleMediaSeeder {
                 put(MediaStore.Images.Media.DATE_ADDED, dateTakenMs / 1000L)
                 put(MediaStore.Images.Media.WIDTH, width)
                 put(MediaStore.Images.Media.HEIGHT, height)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, relativeFolder)
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
+                put(MediaStore.Images.Media.RELATIVE_PATH, relativeFolder)
+                put(MediaStore.Images.Media.IS_PENDING, 1)
             }
 
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
@@ -399,18 +378,12 @@ object SampleMediaSeeder {
             }
             bitmap.recycle()
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val complete = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
-                resolver.update(uri, complete, null, null)
-            }
+            val complete = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+            resolver.update(uri, complete, null, null)
             true
         }.getOrDefault(false)
     }
 
-    /**
-     * Generates a valid playable MP4 video stream using Android hardware MediaCodec + MediaMuxer
-     * so the user can test TikTok-style Vertical Video Triage and the Media3 Transformer Downscaler.
-     */
     private fun insertSyntheticMp4Video(
         context: Context,
         fileName: String,
@@ -420,9 +393,9 @@ object SampleMediaSeeder {
             val tempFile = File(context.cacheDir, "seed_temp_${System.currentTimeMillis()}.mp4")
             val width = 1280
             val height = 720
-            val bitRate = 6_000_000 // High 6 Mbps bitrate so compression yields dramatic savings
+            val bitRate = 6_000_000
             val frameRate = 24
-            val totalFrames = 72 // 3.0 seconds
+            val totalFrames = 72
 
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -480,10 +453,8 @@ object SampleMediaSeeder {
                 put(MediaStore.Video.Media.WIDTH, width)
                 put(MediaStore.Video.Media.HEIGHT, height)
                 put(MediaStore.Video.Media.DURATION, 3000L)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/CleanVaultDemo")
-                    put(MediaStore.Video.Media.IS_PENDING, 1)
-                }
+                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/CleanVaultDemo")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
             }
 
             val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return false
@@ -492,10 +463,8 @@ object SampleMediaSeeder {
             }
             tempFile.delete()
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val complete = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-                resolver.update(uri, complete, null, null)
-            }
+            val complete = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+            resolver.update(uri, complete, null, null)
             true
         }.getOrDefault(false)
     }

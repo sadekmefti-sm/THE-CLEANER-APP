@@ -74,10 +74,11 @@ fun CleanVaultAppRoot(
     viewModel: CleanVaultViewModel = viewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val pendingTrashIntentSender by viewModel.pendingTrashIntentSender.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     var pendingScanMode by remember { mutableStateOf<ScanMode?>(null) }
 
-    // Runtime Permission Launcher for Android 10–15+ Media & Notification Permissions
+    // Runtime Permission Launcher for Android 11–15+ Media & Notification Permissions
     val permissionsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
@@ -86,12 +87,17 @@ fun CleanVaultAppRoot(
         pendingScanMode = null
     }
 
-    // Scoped Storage MediaStore.createTrashRequest IntentSender Launcher
+    // Scoped Storage MediaStore.createTrashRequest IntentSender Launcher (sequentially launches 1,000-item batches)
     val trashRequestLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartIntentSenderForResult()
     ) { result ->
-        if (result.resultCode == Activity.RESULT_OK) {
-            viewModel.onSystemTrashRequestConfirmed()
+        viewModel.onSystemTrashBatchResult(result.resultCode == Activity.RESULT_OK)
+    }
+
+    LaunchedEffect(pendingTrashIntentSender) {
+        val sender = pendingTrashIntentSender
+        if (sender != null) {
+            trashRequestLauncher.launch(IntentSenderRequest.Builder(sender).build())
         }
     }
 
@@ -116,9 +122,7 @@ fun CleanVaultAppRoot(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 add(Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                add(Manifest.permission.ACCESS_MEDIA_LOCATION)
-            }
+            add(Manifest.permission.ACCESS_MEDIA_LOCATION)
         }.toTypedArray()
         permissionsLauncher.launch(perms)
     }
@@ -326,16 +330,7 @@ fun CleanVaultAppRoot(
                             uiState = uiState,
                             onRestoreSingleItem = { id -> viewModel.restoreFromStagingBin(id) },
                             onRestoreAllItems = { viewModel.restoreAllFromStagingBin() },
-                            onEmptyStagingBin = {
-                                val intentSender = viewModel.buildEmptyStagingBinIntentSender(
-                                    onDirectComplete = {}
-                                )
-                                if (intentSender != null) {
-                                    trashRequestLauncher.launch(
-                                        IntentSenderRequest.Builder(intentSender).build()
-                                    )
-                                }
-                            },
+                            onEmptyStagingBin = { viewModel.requestEmptyStagingBin() },
                             onBack = { viewModel.navigateTo(VaultDestination.DASHBOARD) }
                         )
                     }

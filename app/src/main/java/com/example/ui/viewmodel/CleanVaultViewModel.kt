@@ -2,10 +2,12 @@ package com.example.ui.viewmodel
 
 import android.app.Application
 import android.content.IntentSender
-import android.net.Uri
+import android.util.Log
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.example.data.local.CleanVaultDatabase
 import com.example.data.local.MediaItemEntity
 import com.example.data.local.ScanMode
@@ -25,6 +27,7 @@ import com.example.domain.compression.PandaMediaCompressorEngine
 import com.example.domain.scanner.BatteryOptimizationHelper
 import com.example.domain.scanner.SampleMediaSeeder
 import com.example.domain.storage.ScopedStorageTrashManager
+import com.example.domain.storage.TrashBatch
 import com.example.worker.GalleryScanWorker
 import com.example.worker.ScanControlBus
 import kotlinx.coroutines.Dispatchers
@@ -118,6 +121,13 @@ class CleanVaultViewModel(application: Application) : AndroidViewModel(applicati
     private val entitlementManager = LocalEntitlementManager(appContext)
 
     private val undoStack = ArrayDeque<UndoTriageRecord>()
+    private val pendingTrashBatches = ArrayDeque<TrashBatch>()
+    private var activeTrashBatch: TrashBatch? = null
+    private var cumulativeTrashedCount = 0
+    private var cumulativeTrashedBytes = 0L
+
+    private val _pendingTrashIntentSender = MutableStateFlow<IntentSender?>(null)
+    val pendingTrashIntentSender: StateFlow<IntentSender?> = _pendingTrashIntentSender.asStateFlow()
 
     private val _navState = MutableStateFlow(VaultDestination.DASHBOARD)
     private val _selectedCategory = MutableStateFlow(SmartCategory.SIMILAR_CLUSTERS)
@@ -129,6 +139,37 @@ class CleanVaultViewModel(application: Application) : AndroidViewModel(applicati
     private val _canUndo = MutableStateFlow(false)
     private val _snackbarMessage = MutableStateFlow<String?>(null)
     private val _paywallPreview = MutableStateFlow<PremiumFeature?>(null)
+
+    init {
+        resetStaleScanningTelemetryOnStart()
+    }
+
+    private fun resetStaleScanningTelemetryOnStart() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val workInfos = WorkManager.getInstance(appContext)
+                    .getWorkInfosForUniqueWork(GalleryScanWorker.UNIQUE_WORK_NAME)
+                    .get()
+                val hasActiveScan = workInfos.any {
+                    it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED
+                }
+                if (!hasActiveScan) {
+                    val current = dao.getScanTelemetry()
+                    if (current != null && current.isScanning) {
+                        dao.upsertScanTelemetry(
+                            current.copy(
+                                isScanning = false,
+                                isPaused = false,
+                                statusMessage = "Scan interrupted"
+                            )
+                        )
+                    }
+                }
+            }.onFailure { e ->
+                Log.e(TAG, "Failed to verify WorkManager scan state on start", e)
+            }
+        }
+    }
 
     val uiState: StateFlow<CleanVaultUiState> = combine(
         dao.observeAllMedia(),
@@ -302,7 +343,7 @@ class CleanVaultViewModel(application: Application) : AndroidViewModel(applicati
     fun cancelActiveScan() {
         ScanControlBus.isCancelled.set(true)
         ScanControlBus.isPaused.set(false)
-        androidx.work.WorkManager.getInstance(appContext)
+        WorkManager.getInstance(appContext)
             .cancelUniqueWork(GalleryScanWorker.UNIQUE_WORK_NAME)
         viewModelScope.launch {
             val current = dao.getScanTelemetry() ?: ScanTelemetryEntity()
@@ -418,7 +459,6 @@ class CleanVaultViewModel(application: Application) : AndroidViewModel(applicati
 
     fun stageAllCategoryItemsForTrash(items: List<MediaItemEntity>) {
         viewModelScope.launch {
-            // Strictly respect OCR Document Guardrail
             val safeToTrashIds = items
                 .filter { !it.isDocumentOrReceipt }
                 .map { it.mediaStoreId }
@@ -445,60 +485,88 @@ class CleanVaultViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     /**
-     * Invokes MediaStore.createTrashRequest(contentResolver, uris, true) for Android 11–15+
-     * system 30-day Trash bin, or executes direct fallback delete if permitted.
+     * Phase 1.4: Empties the staging bin strictly via MediaStore.createTrashRequest off the main thread,
+     * splitting URIs into batches of at most 1,000 and launching them one after another.
      */
-    fun buildEmptyStagingBinIntentSender(onDirectComplete: () -> Unit): IntentSender? {
-        val staged = uiState.value.stagedTrashItems
-        if (staged.isEmpty()) return null
-        val uris = staged.map { Uri.parse(it.contentUri) }
+    fun requestEmptyStagingBin() {
+        val snapshotItems = uiState.value.stagedTrashItems
+        if (snapshotItems.isEmpty()) return
 
-        // First try direct deletion for app-created MediaStore entries (zero OS dialog needed when app owns files)
-        val resolver = appContext.contentResolver
-        val directlyDeletedIds = mutableListOf<Long>()
-        val remainingUris = mutableListOf<Uri>()
-
-        for (item in staged) {
-            val uri = Uri.parse(item.contentUri)
-            val deletedRows = runCatching { resolver.delete(uri, null, null) }.getOrDefault(0)
-            if (deletedRows > 0) {
-                directlyDeletedIds.add(item.mediaStoreId)
-            } else {
-                remainingUris.add(uri)
-            }
-        }
-
-        if (directlyDeletedIds.isNotEmpty() && remainingUris.isEmpty()) {
-            val bytesReclaimed = staged.filter { it.mediaStoreId in directlyDeletedIds }.sumOf { it.sizeBytes }
-            finalizeTrashDeletion(directlyDeletedIds, bytesReclaimed)
-            onDirectComplete()
-            return null
-        }
-
-        val pendingIntent = ScopedStorageTrashManager.createBatchTrashPendingIntent(
-            contentResolver = resolver,
-            uris = if (remainingUris.isNotEmpty()) remainingUris else uris
-        )
-        return pendingIntent?.intentSender
-    }
-
-    fun onSystemTrashRequestConfirmed() {
-        val staged = uiState.value.stagedTrashItems
-        val ids = staged.map { it.mediaStoreId }
-        val bytes = staged.sumOf { it.sizeBytes }
-        finalizeTrashDeletion(ids, bytes)
-    }
-
-    private fun finalizeTrashDeletion(deletedIds: List<Long>, bytesReclaimed: Long) {
         viewModelScope.launch {
-            dao.deleteMediaByIds(deletedIds)
-            val telemetry = dao.getScanTelemetry() ?: ScanTelemetryEntity()
-            dao.upsertScanTelemetry(
-                telemetry.copy(
-                    lifetimeBytesReclaimed = telemetry.lifetimeBytesReclaimed + bytesReclaimed
+            pendingTrashBatches.clear()
+            activeTrashBatch = null
+            cumulativeTrashedCount = 0
+            cumulativeTrashedBytes = 0L
+
+            val batches = withContext(Dispatchers.Default) {
+                ScopedStorageTrashManager.chunkStagedItemsIntoBatches(
+                    stagedItems = snapshotItems,
+                    maxBatchSize = ScopedStorageTrashManager.MAX_TRASH_BATCH_SIZE
                 )
+            }
+            pendingTrashBatches.addAll(batches)
+            launchNextTrashBatchOffMain()
+        }
+    }
+
+    private suspend fun launchNextTrashBatchOffMain() {
+        val nextBatch = pendingTrashBatches.removeFirstOrNull()
+        if (nextBatch == null) {
+            activeTrashBatch = null
+            if (cumulativeTrashedCount > 0) {
+                _snackbarMessage.value =
+                    "Moved $cumulativeTrashedCount items (${formatStorageSize(cumulativeTrashedBytes)}) to Trash!"
+            }
+            return
+        }
+
+        val result = withContext(Dispatchers.IO) {
+            ScopedStorageTrashManager.createBatchTrashPendingIntent(
+                contentResolver = appContext.contentResolver,
+                uris = nextBatch.uris
             )
-            _snackbarMessage.value = "Moved ${deletedIds.size} items (${formatStorageSize(bytesReclaimed)}) to Trash!"
+        }
+
+        result.fold(
+            onSuccess = { pendingIntent ->
+                activeTrashBatch = nextBatch
+                _pendingTrashIntentSender.value = pendingIntent.intentSender
+            },
+            onFailure = { error ->
+                activeTrashBatch = null
+                pendingTrashBatches.clear()
+                _snackbarMessage.value =
+                    "Could not create trash request: ${error.localizedMessage ?: "Unknown error"}"
+            }
+        )
+    }
+
+    fun onSystemTrashBatchResult(confirmed: Boolean) {
+        _pendingTrashIntentSender.value = null
+        val completedBatch = activeTrashBatch
+        activeTrashBatch = null
+
+        viewModelScope.launch {
+            if (confirmed && completedBatch != null) {
+                withContext(Dispatchers.IO) {
+                    dao.deleteMediaByIds(completedBatch.mediaIds)
+                    val telemetry = dao.getScanTelemetry() ?: ScanTelemetryEntity()
+                    dao.upsertScanTelemetry(
+                        telemetry.copy(
+                            lifetimeBytesReclaimed = telemetry.lifetimeBytesReclaimed + completedBatch.totalBytes
+                        )
+                    )
+                }
+                cumulativeTrashedCount += completedBatch.mediaIds.size
+                cumulativeTrashedBytes += completedBatch.totalBytes
+                launchNextTrashBatchOffMain()
+            } else {
+                pendingTrashBatches.clear()
+                if (cumulativeTrashedCount > 0) {
+                    _snackbarMessage.value =
+                        "Moved $cumulativeTrashedCount items (${formatStorageSize(cumulativeTrashedBytes)}) to Trash before cancellation."
+                }
+            }
         }
     }
 
@@ -633,6 +701,8 @@ class CleanVaultViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     companion object {
+        private const val TAG = "CleanVaultViewModel"
+
         fun formatStorageSize(bytes: Long): String {
             if (bytes <= 0L) return "0 MB"
             val kb = bytes / 1024.0

@@ -6,7 +6,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.Build
 import android.os.Environment
 import android.os.Looper
 import android.provider.MediaStore
@@ -22,12 +21,10 @@ import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import com.example.data.local.MediaItemEntity
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -122,13 +119,10 @@ object PandaMediaCompressorEngine {
             .coerceIn(15, 95)
 
         val durationSeconds = max(1.0, item.durationMs.toDouble() / 1000.0)
-        // Exact formula from specification:
-        // TargetVideoBitrateBps = ((TargetBytes * 8 * 0.95) / DurationSeconds) - AudioBitrateBps (128_000)
         val totalBitsWithOverheadMargin = targetBytes.toDouble() * 8.0 * 0.95
         val rawVideoBitrate = (totalBitsWithOverheadMargin / durationSeconds).roundToInt() - DEFAULT_AUDIO_BITRATE_BPS
         val targetVideoBitrateBps = rawVideoBitrate.coerceIn(MIN_VIDEO_BITRATE_BPS, MAX_VIDEO_BITRATE_BPS)
 
-        // Pair target bitrate with optimal resolution scaling so low bitrates never look blocky
         val targetHeightPx = when {
             preset == CompressionPreset.SMALL_FILE || preset == CompressionPreset.FIT_MESSAGING -> 720
             targetVideoBitrateBps < 1_400_000 -> 720
@@ -172,7 +166,6 @@ object PandaMediaCompressorEngine {
             return primaryHevcResult
         }
 
-        // Automatic fallback to H.264/AVC hardware encoder
         return runMedia3TransformAttempt(
             context = context,
             item = item,
@@ -262,10 +255,8 @@ object PandaMediaCompressorEngine {
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
                 put(MediaStore.Video.Media.DATE_TAKEN, item.dateTakenMillis)
                 put(MediaStore.Video.Media.DURATION, item.durationMs)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/CleanVault")
-                    put(MediaStore.Video.Media.IS_PENDING, 1)
-                }
+                put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/CleanVault")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
             }
 
             val outputUri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
@@ -283,10 +274,8 @@ object PandaMediaCompressorEngine {
             val finalBytes = tempOutputFile.length().coerceAtLeast(1024L)
             tempOutputFile.delete()
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val completeValues = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-                resolver.update(outputUri, completeValues, null, null)
-            }
+            val completeValues = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+            resolver.update(outputUri, completeValues, null, null)
 
             onProgress(100)
             val saved = max(0L, item.sizeBytes - finalBytes)
@@ -334,7 +323,7 @@ object PandaMediaCompressorEngine {
             onProgress(60)
 
             val tempFile = File(context.cacheDir, "photo_comp_${item.mediaStoreId}.jpg")
-            val format = if (useWebpLossy && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val format = if (useWebpLossy) {
                 Bitmap.CompressFormat.WEBP_LOSSY
             } else {
                 Bitmap.CompressFormat.JPEG
@@ -364,10 +353,8 @@ object PandaMediaCompressorEngine {
                 put(MediaStore.Images.Media.DATE_TAKEN, item.dateTakenMillis)
                 put(MediaStore.Images.Media.WIDTH, outW)
                 put(MediaStore.Images.Media.HEIGHT, outH)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/CleanVault")
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/CleanVault")
+                put(MediaStore.Images.Media.IS_PENDING, 1)
             }
 
             val outputUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
@@ -380,10 +367,8 @@ object PandaMediaCompressorEngine {
             val finalBytes = tempFile.length().coerceAtLeast(512L)
             tempFile.delete()
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val doneValues = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
-                resolver.update(outputUri, doneValues, null, null)
-            }
+            val doneValues = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+            resolver.update(outputUri, doneValues, null, null)
 
             onProgress(100)
             val savedBytes = max(0L, item.sizeBytes - finalBytes)
@@ -451,9 +436,7 @@ object PandaMediaCompressorEngine {
     private fun readExifTags(resolver: ContentResolver, uri: Uri): Map<String, String> {
         val map = mutableMapOf<String, String>()
         runCatching {
-            val mediaUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                runCatching { MediaStore.setRequireOriginal(uri) }.getOrDefault(uri)
-            } else uri
+            val mediaUri = runCatching { MediaStore.setRequireOriginal(uri) }.getOrDefault(uri)
 
             resolver.openInputStream(mediaUri)?.use { stream ->
                 val exif = ExifInterface(stream)
@@ -475,7 +458,6 @@ object PandaMediaCompressorEngine {
             for ((tag, value) in tags) {
                 exif.setAttribute(tag, value)
             }
-            // Orientation is normalized during Bitmap decode, so set NORMAL
             exif.setAttribute(
                 ExifInterface.TAG_ORIENTATION,
                 ExifInterface.ORIENTATION_NORMAL.toString()

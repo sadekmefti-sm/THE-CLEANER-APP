@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.data.local.SensitivityLevel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 private val Context.entitlementDataStore by preferencesDataStore(name = "cleanvault_entitlements")
@@ -65,14 +66,7 @@ class LocalEntitlementManager(private val context: Context) : EntitlementManager
         }
 
     override suspend fun isFeatureAllowed(feature: PremiumFeature): Boolean {
-        var allowed = true
-        context.entitlementDataStore.data.map { prefs ->
-            prefs[KEY_PRO_UNLOCKED] ?: true
-        }.collect { value ->
-            allowed = value
-            return@collect
-        }
-        return allowed
+        return context.entitlementDataStore.data.first()[KEY_PRO_UNLOCKED] ?: true
     }
 
     override suspend fun setProUnlockedForTesting(unlocked: Boolean) {
